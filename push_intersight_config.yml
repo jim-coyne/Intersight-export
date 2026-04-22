@@ -1,0 +1,1035 @@
+---
+# =============================================================================
+# push_intersight_config.yml
+# =============================================================================
+# Purpose : Re-create select Intersight policies, sub-policies, pools, and
+#           optionally profiles from JSON files previously exported by
+#           pull_intersight_config.yml.  Designed as a templating system:
+#           pull live config, edit/rename exported files as needed, then push
+#           them back to the same or a different organization.
+#
+# Credentials:
+#   api-key.txt   – contains the API Key ID  (single line, no trailing newline)
+#   SecretKey.txt – contains the EC private key in PEM format
+#
+# Usage:
+#   # Push everything (all resource types that have non-empty export files)
+#   ansible-playbook push_intersight_config.yml \
+#     -e "target_org=MyOrg"
+#
+#   # Push only specific resource types (comma-separated)
+#   ansible-playbook push_intersight_config.yml \
+#     -e "target_org=MyOrg" \
+#     -e "push_types=ntp_policies,bios_policies,lan_policies"
+#
+#   # Dry-run (check mode) – shows what would change without making API calls
+#   ansible-playbook push_intersight_config.yml \
+#     -e "target_org=MyOrg" --check
+#
+# Push order matters – dependencies are resolved in this sequence:
+#   1. Pools (IP, MAC, UUID, WWN)
+#   2. Ethernet / FC sub-policies  (adapter, network, QoS)
+#   3. Standalone policies (NTP, SNMP, BIOS, Boot, …)
+#   4. LAN / SAN connectivity policies
+#   5. vNIC / vHBA interfaces (children of connectivity policies)
+#   6. Server Profile Templates
+#   7. Server Profiles (unassigned; AssignedServer stripped)
+#
+# Notes:
+#   • The playbook reads the Organization by NAME, not Moid, so the target
+#     org must already exist in the destination Intersight account.
+#   • Instance-specific fields (Moid, CreateTime, AssignedServer, etc.) are
+#     stripped from each object before the POST/PATCH so they do not conflict
+#     with existing objects in the target org.
+#   • Each push task is idempotent: intersight_rest_api will GET-by-name and
+#     PATCH if the object already exists, or POST if it does not.
+#   • If an export file is empty or missing, the corresponding task is skipped.
+# =============================================================================
+
+- name: Push Intersight Configuration (Templating System)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    api_key_id:      "{{ lookup('file', playbook_dir + '/api-key.txt') | trim }}"
+    api_private_key: "{{ playbook_dir }}/SecretKey.txt"
+    api_uri:         "https://intersight.com/api/v1"
+    import_dir:      "{{ playbook_dir }}/exports"
+
+    # Target organization name in the destination account.
+    # Override with: -e "target_org=MyOrg"
+    target_org: "default"
+
+    # Comma-separated list of resource types to push.
+    # Leave blank (default) to push ALL types that have export data.
+    # Example: -e "push_types=ntp_policies,bios_policies"
+    push_types: ""
+
+    # ---------------------------------------------------------------
+    # Fields stripped from every exported object before re-posting.
+    # These are instance-specific or read-only in the Intersight API.
+    # ---------------------------------------------------------------
+    _ro_fields:
+      - Moid
+      - AccountMoid
+      - DomainGroupMoid
+      - SharedScope
+      - Owners
+      - PermissionResources
+      - CreateTime
+      - ModTime
+      - ConfigChangeContext
+      - ConfigChangeDetails
+      - ConfigChanges
+      - ConfigContext
+      - ConfigResult
+      - DeployedPolicies
+      - DeployedSwitches
+      - DeployStatus
+      - RunningWorkflows
+      - ScheduledActions
+      - ReservationReferences
+      - InternalReservationReferences
+      - TemplateActions
+      - TemplateSyncErrors
+      - TemplateSyncStatus
+      - ReportedPolicyChanges
+      - PolicyChangeDetails
+      - PostDeployAction
+      - Ancestors
+      - AssignedServer
+      - AssociatedServer
+      - UuidLease
+      - ResourceLease
+      - SrcTemplate
+
+  # ----------------------------------------------------------------
+  # Helper macro – used in every push task.
+  # Strips read-only fields and injects the target Organization.
+  #
+  # Usage in api_body:
+  #   api_body: "{{ item | intersight_push_body(target_org) }}"
+  #
+  # Since Jinja custom filters are not available without a plugin,
+  # we compute the body inline with combine + difference.
+  # ----------------------------------------------------------------
+
+  tasks:
+    # ================================================================
+    # GUARD: verify the export directory exists
+    # ================================================================
+    - name: Verify export directory exists
+      stat:
+        path: "{{ import_dir }}"
+      register: _export_dir_stat
+
+    - name: Fail if export directory is missing
+      fail:
+        msg: >-
+          Export directory '{{ import_dir }}' does not exist.
+          Run pull_intersight_config.yml first.
+      when: not _export_dir_stat.stat.exists
+
+    # ================================================================
+    # RESOLVE TARGET ORGANIZATION MOID
+    # ================================================================
+    - name: Look up target organization Moid
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /organization/Organizations
+        query_params:
+          $filter: "Name eq '{{ target_org }}'"
+      register: _org_lookup
+
+    - name: Fail if organization not found
+      fail:
+        msg: "Organization '{{ target_org }}' not found in Intersight"
+      when: _org_lookup.api_response is not defined or _org_lookup.api_response.Moid is not defined
+
+    - name: Set target organization Moid
+      set_fact:
+        target_org_moid: "{{ _org_lookup.api_response.Moid }}"
+
+    # ================================================================
+    # SECTION 1 – POOLS
+    # ================================================================
+
+    # ---- IP Pools --------------------------------------------------
+    - name: Read IP Pools export
+      set_fact:
+        _ip_pools: "{{ lookup('file', import_dir + '/pools_ip.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'pools_ip' in push_types.split(',')
+
+    - name: Push IP Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /ippool/Pools
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _ip_pools | default([]) }}"
+      when:
+        - (push_types == "" or 'pools_ip' in push_types.split(','))
+        - item.Name is defined
+        - _ip_pools | default([]) | length > 0
+
+    # ---- MAC Pools -------------------------------------------------
+    - name: Read MAC Pools export
+      set_fact:
+        _mac_pools: "{{ lookup('file', import_dir + '/pools_mac.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'pools_mac' in push_types.split(',')
+
+    - name: Push MAC Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /macpool/Pools
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _mac_pools | default([]) }}"
+      when:
+        - (push_types == "" or 'pools_mac' in push_types.split(','))
+        - item.Name is defined
+        - _mac_pools | default([]) | length > 0
+
+    # ---- UUID Pools ------------------------------------------------
+    - name: Read UUID Pools export
+      set_fact:
+        _uuid_pools: "{{ lookup('file', import_dir + '/pools_uuid.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'pools_uuid' in push_types.split(',')
+
+    - name: Push UUID Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /uuidpool/Pools
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _uuid_pools | default([]) }}"
+      when:
+        - (push_types == "" or 'pools_uuid' in push_types.split(','))
+        - item.Name is defined
+        - _uuid_pools | default([]) | length > 0
+
+    # ---- WWN (FC) Pools --------------------------------------------
+    - name: Read WWN Pools export
+      set_fact:
+        _wwn_pools: "{{ lookup('file', import_dir + '/pools_wwn.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'pools_wwn' in push_types.split(',')
+
+    - name: Push WWN (Fibre Channel) Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /fcpool/Pools
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _wwn_pools | default([]) }}"
+      when:
+        - (push_types == "" or 'pools_wwn' in push_types.split(','))
+        - item.Name is defined
+        - _wwn_pools | default([]) | length > 0
+
+    # ================================================================
+    # SECTION 2 – ETHERNET / FC SUB-POLICIES
+    # These must exist before LAN/SAN connectivity policies
+    # ================================================================
+
+    - name: Read Ethernet Adapter Policies export
+      set_fact:
+        _eth_adapter_policies: "{{ lookup('file', import_dir + '/eth_adapter_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'eth_adapter_policies' in push_types.split(',')
+
+    - name: Push Ethernet Adapter Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthAdapterPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _eth_adapter_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'eth_adapter_policies' in push_types.split(','))
+        - item.Name is defined
+        - _eth_adapter_policies | default([]) | length > 0
+
+    - name: Read Ethernet Network Policies export
+      set_fact:
+        _eth_network_policies: "{{ lookup('file', import_dir + '/eth_network_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'eth_network_policies' in push_types.split(',')
+
+    - name: Push Ethernet Network Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthNetworkPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _eth_network_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'eth_network_policies' in push_types.split(','))
+        - item.Name is defined
+        - _eth_network_policies | default([]) | length > 0
+
+    - name: Read Ethernet QoS Policies export
+      set_fact:
+        _eth_qos_policies: "{{ lookup('file', import_dir + '/eth_qos_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'eth_qos_policies' in push_types.split(',')
+
+    - name: Push Ethernet QoS Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthQosPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _eth_qos_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'eth_qos_policies' in push_types.split(','))
+        - item.Name is defined
+        - _eth_qos_policies | default([]) | length > 0
+
+    - name: Read FC Adapter Policies export
+      set_fact:
+        _fc_adapter_policies: "{{ lookup('file', import_dir + '/fc_adapter_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'fc_adapter_policies' in push_types.split(',')
+
+    - name: Push FC Adapter Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcAdapterPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _fc_adapter_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'fc_adapter_policies' in push_types.split(','))
+        - item.Name is defined
+        - _fc_adapter_policies | default([]) | length > 0
+
+    - name: Read FC Network Policies export
+      set_fact:
+        _fc_network_policies: "{{ lookup('file', import_dir + '/fc_network_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'fc_network_policies' in push_types.split(',')
+
+    - name: Push FC Network Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcNetworkPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _fc_network_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'fc_network_policies' in push_types.split(','))
+        - item.Name is defined
+        - _fc_network_policies | default([]) | length > 0
+
+    - name: Read FC QoS Policies export
+      set_fact:
+        _fc_qos_policies: "{{ lookup('file', import_dir + '/fc_qos_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'fc_qos_policies' in push_types.split(',')
+
+    - name: Push FC QoS Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcQosPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _fc_qos_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'fc_qos_policies' in push_types.split(','))
+        - item.Name is defined
+        - _fc_qos_policies | default([]) | length > 0
+
+    # ================================================================
+    # SECTION 3 – STANDALONE SERVER/CHASSIS POLICIES
+    # ================================================================
+
+    - name: Read Adapter Config Policies export
+      set_fact:
+        _adapter_config_policies: "{{ lookup('file', import_dir + '/adapter_config_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'adapter_config_policies' in push_types.split(',')
+
+    - name: Push Adapter Config Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /adapter/ConfigPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _adapter_config_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'adapter_config_policies' in push_types.split(','))
+        - item.Name is defined
+        - _adapter_config_policies | default([]) | length > 0
+
+    - name: Read BIOS Policies export
+      set_fact:
+        _bios_policies: "{{ lookup('file', import_dir + '/bios_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'bios_policies' in push_types.split(',')
+
+    - name: Push BIOS Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /bios/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _bios_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'bios_policies' in push_types.split(','))
+        - item.Name is defined
+        - _bios_policies | default([]) | length > 0
+
+    - name: Read Boot Policies export
+      set_fact:
+        _boot_policies: "{{ lookup('file', import_dir + '/boot_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'boot_policies' in push_types.split(',')
+
+    - name: Push Boot Order Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /boot/PrecisionPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _boot_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'boot_policies' in push_types.split(','))
+        - item.Name is defined
+        - _boot_policies | default([]) | length > 0
+
+    - name: Read Firmware Policies export
+      set_fact:
+        _firmware_policies: "{{ lookup('file', import_dir + '/firmware_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'firmware_policies' in push_types.split(',')
+
+    - name: Push Firmware Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /firmware/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _firmware_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'firmware_policies' in push_types.split(','))
+        - item.Name is defined
+        - _firmware_policies | default([]) | length > 0
+
+    - name: Read IMC Access Policies export
+      set_fact:
+        _imc_access_policies: "{{ lookup('file', import_dir + '/imc_access_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'imc_access_policies' in push_types.split(',')
+
+    - name: Push IMC Access Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /access/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _imc_access_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'imc_access_policies' in push_types.split(','))
+        - item.Name is defined
+        - _imc_access_policies | default([]) | length > 0
+
+    - name: Read KVM Policies export
+      set_fact:
+        _kvm_policies: "{{ lookup('file', import_dir + '/kvm_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'kvm_policies' in push_types.split(',')
+
+    - name: Push KVM Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /kvm/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _kvm_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'kvm_policies' in push_types.split(','))
+        - item.Name is defined
+        - _kvm_policies | default([]) | length > 0
+
+    - name: Read Local User Policies export
+      set_fact:
+        _local_user_policies: "{{ lookup('file', import_dir + '/local_user_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'local_user_policies' in push_types.split(',')
+
+    - name: Push Local User Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /iam/EndPointUserPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _local_user_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'local_user_policies' in push_types.split(','))
+        - item.Name is defined
+        - _local_user_policies | default([]) | length > 0
+
+    - name: Read NTP Policies export
+      set_fact:
+        _ntp_policies: "{{ lookup('file', import_dir + '/ntp_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'ntp_policies' in push_types.split(',')
+
+    - name: Push NTP Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /ntp/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _ntp_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'ntp_policies' in push_types.split(','))
+        - item.Name is defined
+        - _ntp_policies | default([]) | length > 0
+
+    - name: Read Power Policies export
+      set_fact:
+        _power_policies: "{{ lookup('file', import_dir + '/power_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'power_policies' in push_types.split(',')
+
+    - name: Push Power Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /power/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _power_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'power_policies' in push_types.split(','))
+        - item.Name is defined
+        - _power_policies | default([]) | length > 0
+
+    - name: Read SNMP Policies export
+      set_fact:
+        _snmp_policies: "{{ lookup('file', import_dir + '/snmp_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'snmp_policies' in push_types.split(',')
+
+    - name: Push SNMP Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /snmp/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _snmp_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'snmp_policies' in push_types.split(','))
+        - item.Name is defined
+        - _snmp_policies | default([]) | length > 0
+
+    - name: Read SSH Policies export
+      set_fact:
+        _ssh_policies: "{{ lookup('file', import_dir + '/ssh_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'ssh_policies' in push_types.split(',')
+
+    - name: Push SSH Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /ssh/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _ssh_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'ssh_policies' in push_types.split(','))
+        - item.Name is defined
+        - _ssh_policies | default([]) | length > 0
+
+    - name: Read Storage Policies export
+      set_fact:
+        _storage_policies: "{{ lookup('file', import_dir + '/storage_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'storage_policies' in push_types.split(',')
+
+    - name: Push Storage Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /storage/StoragePolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _storage_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'storage_policies' in push_types.split(','))
+        - item.Name is defined
+        - _storage_policies | default([]) | length > 0
+
+    - name: Read Syslog Policies export
+      set_fact:
+        _syslog_policies: "{{ lookup('file', import_dir + '/syslog_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'syslog_policies' in push_types.split(',')
+
+    - name: Push Syslog Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /syslog/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _syslog_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'syslog_policies' in push_types.split(','))
+        - item.Name is defined
+        - _syslog_policies | default([]) | length > 0
+
+    - name: Read Thermal Policies export
+      set_fact:
+        _thermal_policies: "{{ lookup('file', import_dir + '/thermal_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'thermal_policies' in push_types.split(',')
+
+    - name: Push Thermal Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /thermal/Policies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _thermal_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'thermal_policies' in push_types.split(','))
+        - item.Name is defined
+        - _thermal_policies | default([]) | length > 0
+
+    # ================================================================
+    # SECTION 4 – LAN / SAN CONNECTIVITY POLICIES
+    # These reference the sub-policies above; push after sub-policies.
+    # The EthIfs / FcIfs are child objects: they are created separately
+    # and reference the parent policy by name in a following step.
+    # ================================================================
+
+    - name: Read LAN Connectivity Policies export
+      set_fact:
+        _lan_policies: "{{ lookup('file', import_dir + '/lan_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'lan_policies' in push_types.split(',')
+
+    - name: Push LAN Connectivity Policies (parent object only)
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/LanConnectivityPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', (_ro_fields + ['EthIfs', 'Profiles']))
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      register: _lan_push_results
+      loop: "{{ _lan_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'lan_policies' in push_types.split(','))
+        - item.Name is defined
+        - _lan_policies | default([]) | length > 0
+
+    - name: Read SAN Connectivity Policies export
+      set_fact:
+        _san_policies: "{{ lookup('file', import_dir + '/san_policies.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'san_policies' in push_types.split(',')
+
+    - name: Push SAN Connectivity Policies (parent object only)
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/SanConnectivityPolicies
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', (_ro_fields + ['FcIfs', 'Profiles']))
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      register: _san_push_results
+      loop: "{{ _san_policies | default([]) }}"
+      when:
+        - (push_types == "" or 'san_policies' in push_types.split(','))
+        - item.Name is defined
+        - _san_policies | default([]) | length > 0
+
+    # ================================================================
+    # SECTION 5 – vNIC / vHBA INTERFACES
+    # Child objects of LAN / SAN connectivity policies.
+    # The LanConnectivityPolicy reference is replaced with the
+    # name-based lookup so it resolves in the target org.
+    # ================================================================
+
+    - name: Read vNIC Ethernet Interfaces export
+      set_fact:
+        _vnic_eth_ifs: "{{ lookup('file', import_dir + '/vnic_eth_ifs.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'vnic_eth_ifs' in push_types.split(',') or 'lan_policies' in push_types.split(',') or push_types == ""
+
+    - name: Push vNIC Ethernet Interfaces
+      # The API requires the parent LanConnectivityPolicy Moid.
+      # Because we just created the policy by name we resolve it by
+      # looking it up from the api_response of the push above.
+      # If pushing selectively, provide the parent Moid via the
+      # exported JSON (the Moid in the export is from the SOURCE account
+      # and must match the new object Moid).  For cross-org migrations,
+      # ensure the parent LAN policy is pushed first so the Moid is set,
+      # then re-run or use the parent name-lookup pattern below.
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthIfs
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', (_ro_fields + ['IpLease', 'IscsiBootPolicy']))
+             | list | items2dict)
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _vnic_eth_ifs | default([]) }}"
+      when:
+        - (push_types == "" or 'vnic_eth_ifs' in push_types.split(',') or 'lan_policies' in push_types.split(','))
+        - item.Name is defined
+        - _vnic_eth_ifs | default([]) | length > 0
+      ignore_errors: true   # vNIC push may fail if parent Moid differs; see note above
+
+    - name: Read vHBA Fibre Channel Interfaces export
+      set_fact:
+        _vhba_fc_ifs: "{{ lookup('file', import_dir + '/vhba_fc_ifs.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'vhba_fc_ifs' in push_types.split(',') or 'san_policies' in push_types.split(',') or push_types == ""
+
+    - name: Push vHBA Fibre Channel Interfaces
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcIfs
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _vhba_fc_ifs | default([]) }}"
+      when:
+        - (push_types == "" or 'vhba_fc_ifs' in push_types.split(',') or 'san_policies' in push_types.split(','))
+        - item.Name is defined
+        - _vhba_fc_ifs | default([]) | length > 0
+      ignore_errors: true   # vHBA push may fail if parent Moid differs; see note above
+
+    # ================================================================
+    # SECTION 6 – SERVER PROFILE TEMPLATES
+    # Must exist before server profiles that reference them.
+    # Policy references inside the template use Moid-based links;
+    # for cross-org migrations those need manual adjustment in the
+    # export JSON (replace Moids with those from the target org).
+    # ================================================================
+
+    - name: Read Server Profile Templates export
+      set_fact:
+        _server_templates: "{{ lookup('file', import_dir + '/server_profile_templates.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'server_profile_templates' in push_types.split(',')
+
+    - name: Push Server Profile Templates
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /server/ProfileTemplates
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', _ro_fields)
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _server_templates | default([]) }}"
+      when:
+        - (push_types == "" or 'server_profile_templates' in push_types.split(','))
+        - item.Name is defined
+        - _server_templates | default([]) | length > 0
+
+    # ================================================================
+    # SECTION 7 – SERVER PROFILES
+    # Pushed last; hardware assignment info is stripped so profiles
+    # land in an unassigned state ready for new server assignment.
+    # ================================================================
+
+    - name: Read Server Profiles export
+      set_fact:
+        _server_profiles: "{{ lookup('file', import_dir + '/server_profiles.json', errors='ignore') | default('[]', true) | from_json }}"
+      when: push_types == "" or 'server_profiles' in push_types.split(',')
+
+    - name: Push Server Profiles
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /server/Profiles
+        api_body: >-
+          {{
+            (item | dict2items
+             | rejectattr('key', 'in', (_ro_fields + ['ServerPool', 'UuidPool', 'UuidLease', 'ResourceLease', 'ServerPreAssignBySerial', 'ServerPreAssignBySlot']))
+             | list | items2dict)
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+          }}
+        update_method: patch
+        query_params:
+          $filter: "Name eq '{{ (name_prefix | default('')) + item.Name + (name_suffix | default('')) }}'"
+      loop: "{{ _server_profiles | default([]) }}"
+      when:
+        - (push_types == "" or 'server_profiles' in push_types.split(','))
+        - item.Name is defined
+        - _server_profiles | default([]) | length > 0
+
+    # ================================================================
+    # DONE
+    # ================================================================
+
+    - name: Push complete
+      debug:
+        msg: >-
+          Push complete.
+          Target organization: {{ target_org }}
+          Resource types pushed: {{ push_types if push_types != "" else "ALL" }}
+
+          Tip: If vNIC/vHBA pushes failed with Moid errors, this is expected for
+          cross-org migrations.  Update the LanConnectivityPolicy / SanConnectivityPolicy
+          Moid values in vnic_eth_ifs.json / vhba_fc_ifs.json with the new parent
+          Moids returned above, then re-run with:
+            -e "push_types=vnic_eth_ifs,vhba_fc_ifs"

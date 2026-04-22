@@ -1,0 +1,817 @@
+---
+# =============================================================================
+# pull_intersight_config.yml
+# =============================================================================
+# Purpose : Export all Intersight policies, profiles, pools, and sub-resources
+#           to JSON files under ./exports/.  The exports are designed so that
+#           push_intersight_config.yml can read them back and re-create the
+#           same objects in any target organization.
+#
+# Credentials:
+#   api-key.txt   – contains the API Key ID  (single line, no trailing newline)
+#   SecretKey.txt – contains the EC private key in PEM format
+#
+# Usage:
+#   ansible-playbook pull_intersight_config.yml
+#   ansible-playbook pull_intersight_config.yml -e "export_dir=/tmp/my-exports"
+# =============================================================================
+
+- name: Pull All Intersight Configuration
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    api_key_id:      "{{ lookup('file', playbook_dir + '/api-key.txt') | trim }}"
+    api_private_key: "{{ playbook_dir }}/SecretKey.txt"
+    api_uri:         "https://intersight.com/api/v1"
+    export_dir:      "{{ playbook_dir }}/exports"
+
+    # Fields that are instance-specific and must be stripped before
+    # any export file is used as a re-deployable template.
+    _strip_fields:
+      - AccountMoid
+      - DomainGroupMoid
+      - SharedScope
+      - Owners
+      - PermissionResources
+      - CreateTime
+      - ModTime
+      - ConfigChangeContext
+      - ConfigChangeDetails
+      - ConfigChanges
+      - ConfigContext
+      - ConfigResult
+      - DeployedPolicies
+      - DeployedSwitches
+      - RunningWorkflows
+      - ScheduledActions
+      - ReservationReferences
+      - InternalReservationReferences
+      - TemplateActions
+      - TemplateSyncErrors
+      - ReportedPolicyChanges
+      - PolicyChangeDetails
+      - PostDeployAction
+      - Ancestors
+
+  # ------------------------------------------------------------------
+  # Convenience anchor – reused in every intersight_rest_api call
+  # ------------------------------------------------------------------
+  tasks:
+
+    - name: Ensure export directory exists
+      file:
+        path: "{{ export_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ================================================================
+    # POOLS
+    # Using intersight_rest_api with return_list: true — this returns
+    # all matching objects as a list in api_response (not just the
+    # first object).  intersight_info is a hardware inventory module
+    # and does not support resource_path.
+    # ================================================================
+
+    - name: Get IP Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /ippool/Pools
+        return_list:     true
+      register: r_ip_pools
+
+    - name: Get MAC Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /macpool/Pools
+        return_list:     true
+      register: r_mac_pools
+
+    - name: Get UUID Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /uuidpool/Pools
+        return_list:     true
+      register: r_uuid_pools
+
+    - name: Get WWN Pools
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /fcpool/Pools
+        return_list:     true
+      register: r_wwn_pools
+
+    # ================================================================
+    # ETHERNET / VNIC SUB-POLICIES
+    # ================================================================
+
+    - name: Get Ethernet Adapter Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthAdapterPolicies
+        return_list:     true
+      register: r_eth_adapter_policies
+
+    - name: Get Ethernet Network Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthNetworkPolicies
+        return_list:     true
+      register: r_eth_network_policies
+
+    - name: Get Ethernet QoS Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthQosPolicies
+        return_list:     true
+      register: r_eth_qos_policies
+
+    - name: Get Fibre-Channel Adapter Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcAdapterPolicies
+        return_list:     true
+      register: r_fc_adapter_policies
+
+    - name: Get Fibre-Channel Network Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcNetworkPolicies
+        return_list:     true
+      register: r_fc_network_policies
+
+    - name: Get Fibre-Channel QoS Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcQosPolicies
+        return_list:     true
+      register: r_fc_qos_policies
+
+    # ================================================================
+    # CONNECTIVITY POLICIES AND THEIR CHILD vNICs / vHBAs
+    # ================================================================
+
+    - name: Get LAN Connectivity Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/LanConnectivityPolicies
+        return_list:     true
+      register: r_lan_policies
+
+    - name: Get vNIC Ethernet Interfaces (children of LAN Connectivity)
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/EthIfs
+        return_list:     true
+      register: r_vnic_eth_ifs
+
+    - name: Get SAN Connectivity Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/SanConnectivityPolicies
+        return_list:     true
+      register: r_san_policies
+
+    - name: Get vHBA Fibre-Channel Interfaces (children of SAN Connectivity)
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /vnic/FcIfs
+        return_list:     true
+      register: r_vhba_fc_ifs
+
+    # ================================================================
+    # SERVER / CHASSIS / DOMAIN POLICIES
+    # ================================================================
+
+    - name: Get Adapter Config Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /adapter/ConfigPolicies
+        return_list:     true
+      register: r_adapter_config_policies
+
+    - name: Get BIOS Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /bios/Policies
+        return_list:     true
+      register: r_bios_policies
+
+    - name: Get Boot Order Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /boot/PrecisionPolicies
+        return_list:     true
+      register: r_boot_policies
+
+    - name: Get Firmware Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /firmware/Policies
+        return_list:     true
+      register: r_firmware_policies
+
+    - name: Get IMC Access Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /access/Policies
+        return_list:     true
+      register: r_imc_access_policies
+
+    - name: Get KVM Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /kvm/Policies
+        return_list:     true
+      register: r_kvm_policies
+
+    - name: Get Local User Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /iam/EndPointUserPolicies
+        return_list:     true
+      register: r_local_user_policies
+
+    - name: Get NTP Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /ntp/Policies
+        return_list:     true
+      register: r_ntp_policies
+
+    - name: Get Power Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /power/Policies
+        return_list:     true
+      register: r_power_policies
+
+    - name: Get SNMP Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /snmp/Policies
+        return_list:     true
+      register: r_snmp_policies
+
+    - name: Get SSH Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /ssh/Policies
+        return_list:     true
+      register: r_ssh_policies
+
+    - name: Get Storage Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /storage/StoragePolicies
+        return_list:     true
+      register: r_storage_policies
+
+    - name: Get Syslog Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /syslog/Policies
+        return_list:     true
+      register: r_syslog_policies
+
+    - name: Get Thermal Policies
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /thermal/Policies
+        return_list:     true
+      register: r_thermal_policies
+
+    # ================================================================
+    # PROFILES & TEMPLATES
+    # NOTE: Profiles are exported for reference / inventory; the push
+    #       playbook can optionally re-create them in a target org.
+    #       AssignedServer and AssociatedServer are stripped so the
+    #       re-created profiles are in an unassigned state.
+    # ================================================================
+
+    - name: Get Server Profile Templates
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /server/ProfileTemplates
+        return_list:     true
+      register: r_server_templates
+
+    - name: Get Server Profiles
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /server/Profiles
+        return_list:     true
+      register: r_server_profiles
+
+    - name: Get Chassis Profiles
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /chassis/Profiles
+        return_list:     true
+      register: r_chassis_profiles
+
+    - name: Get Domain / Switch Cluster Profiles
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   /fabric/SwitchClusterProfiles
+        return_list:     true
+      register: r_domain_profiles
+
+    # ================================================================
+    # WRITE EXPORT FILES
+    # Each file contains the raw Results array from Intersight.
+    # Instance-specific metadata is noted in the strip list above
+    # and handled during the push phase.
+    # ================================================================
+
+    - name: Write pool export files
+      copy:
+        content: "{{ item.data | rejectattr('SharedScope', 'equalto', 'shared') | list | to_nice_json }}"
+        dest: "{{ export_dir }}/{{ item.name }}.json"
+      loop:
+        - { name: "pools_ip",   data: "{{ r_ip_pools.api_response   | default([]) }}" }
+        - { name: "pools_mac",  data: "{{ r_mac_pools.api_response  | default([]) }}" }
+        - { name: "pools_uuid", data: "{{ r_uuid_pools.api_response | default([]) }}" }
+        - { name: "pools_wwn",  data: "{{ r_wwn_pools.api_response  | default([]) }}" }
+
+    - name: Write ethernet sub-policy export files
+      copy:
+        content: "{{ item.data | rejectattr('SharedScope', 'equalto', 'shared') | list | to_nice_json }}"
+        dest: "{{ export_dir }}/{{ item.name }}.json"
+      loop:
+        - { name: "eth_adapter_policies", data: "{{ r_eth_adapter_policies.api_response | default([]) }}" }
+        - { name: "eth_network_policies", data: "{{ r_eth_network_policies.api_response | default([]) }}" }
+        - { name: "eth_qos_policies",     data: "{{ r_eth_qos_policies.api_response     | default([]) }}" }
+        - { name: "fc_adapter_policies",  data: "{{ r_fc_adapter_policies.api_response  | default([]) }}" }
+        - { name: "fc_network_policies",  data: "{{ r_fc_network_policies.api_response  | default([]) }}" }
+        - { name: "fc_qos_policies",      data: "{{ r_fc_qos_policies.api_response      | default([]) }}" }
+
+    - name: Write connectivity policy and vNIC/vHBA export files
+      copy:
+        content: "{{ item.data | rejectattr('SharedScope', 'equalto', 'shared') | list | to_nice_json }}"
+        dest: "{{ export_dir }}/{{ item.name }}.json"
+      loop:
+        - { name: "lan_policies",   data: "{{ r_lan_policies.api_response   | default([]) }}" }
+        - { name: "vnic_eth_ifs",   data: "{{ r_vnic_eth_ifs.api_response   | default([]) }}" }
+        - { name: "san_policies",   data: "{{ r_san_policies.api_response   | default([]) }}" }
+        - { name: "vhba_fc_ifs",    data: "{{ r_vhba_fc_ifs.api_response    | default([]) }}" }
+
+    - name: Write server/chassis/domain policy export files
+      copy:
+        content: "{{ item.data | rejectattr('SharedScope', 'equalto', 'shared') | list | to_nice_json }}"
+        dest: "{{ export_dir }}/{{ item.name }}.json"
+      loop:
+        - { name: "adapter_config_policies", data: "{{ r_adapter_config_policies.api_response | default([]) }}" }
+        - { name: "bios_policies",           data: "{{ r_bios_policies.api_response           | default([]) }}" }
+        - { name: "boot_policies",           data: "{{ r_boot_policies.api_response           | default([]) }}" }
+        - { name: "firmware_policies",       data: "{{ r_firmware_policies.api_response       | default([]) }}" }
+        - { name: "imc_access_policies",     data: "{{ r_imc_access_policies.api_response     | default([]) }}" }
+        - { name: "kvm_policies",            data: "{{ r_kvm_policies.api_response            | default([]) }}" }
+        - { name: "local_user_policies",     data: "{{ r_local_user_policies.api_response     | default([]) }}" }
+        - { name: "ntp_policies",            data: "{{ r_ntp_policies.api_response            | default([]) }}" }
+        - { name: "power_policies",          data: "{{ r_power_policies.api_response          | default([]) }}" }
+        - { name: "snmp_policies",           data: "{{ r_snmp_policies.api_response           | default([]) }}" }
+        - { name: "ssh_policies",            data: "{{ r_ssh_policies.api_response            | default([]) }}" }
+        - { name: "storage_policies",        data: "{{ r_storage_policies.api_response        | default([]) }}" }
+        - { name: "syslog_policies",         data: "{{ r_syslog_policies.api_response         | default([]) }}" }
+        - { name: "thermal_policies",        data: "{{ r_thermal_policies.api_response        | default([]) }}" }
+
+    # ================================================================
+    # WRITE INDIVIDUAL PER-OBJECT FILES
+    # Each object gets its own <Name>.json inside a type subdirectory.
+    # vNIC/vHBA names are only unique within their parent policy so
+    # the Moid is appended to prevent collisions.
+    # ================================================================
+
+    - name: Create per-object export subdirectories
+      file:
+        path: "{{ export_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - pools_ip
+        - pools_mac
+        - pools_uuid
+        - pools_wwn
+        - eth_adapter_policies
+        - eth_network_policies
+        - eth_qos_policies
+        - fc_adapter_policies
+        - fc_network_policies
+        - fc_qos_policies
+        - lan_policies
+        - vnic_eth_ifs
+        - san_policies
+        - vhba_fc_ifs
+        - adapter_config_policies
+        - bios_policies
+        - boot_policies
+        - firmware_policies
+        - imc_access_policies
+        - kvm_policies
+        - local_user_policies
+        - ntp_policies
+        - power_policies
+        - snmp_policies
+        - ssh_policies
+        - storage_policies
+        - syslog_policies
+        - thermal_policies
+        - server_profile_templates
+        - server_profiles
+        - chassis_profiles
+        - domain_profiles
+
+    - name: Write individual IP Pool files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/pools_ip/{{ item.Name }}.json"
+      loop: "{{ r_ip_pools.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual MAC Pool files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/pools_mac/{{ item.Name }}.json"
+      loop: "{{ r_mac_pools.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual UUID Pool files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/pools_uuid/{{ item.Name }}.json"
+      loop: "{{ r_uuid_pools.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual WWN Pool files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/pools_wwn/{{ item.Name }}.json"
+      loop: "{{ r_wwn_pools.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Ethernet Adapter Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/eth_adapter_policies/{{ item.Name }}.json"
+      loop: "{{ r_eth_adapter_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Ethernet Network Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/eth_network_policies/{{ item.Name }}.json"
+      loop: "{{ r_eth_network_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Ethernet QoS Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/eth_qos_policies/{{ item.Name }}.json"
+      loop: "{{ r_eth_qos_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual FC Adapter Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/fc_adapter_policies/{{ item.Name }}.json"
+      loop: "{{ r_fc_adapter_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual FC Network Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/fc_network_policies/{{ item.Name }}.json"
+      loop: "{{ r_fc_network_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual FC QoS Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/fc_qos_policies/{{ item.Name }}.json"
+      loop: "{{ r_fc_qos_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual LAN Connectivity Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/lan_policies/{{ item.Name }}.json"
+      loop: "{{ r_lan_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual vNIC Ethernet Interface files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/vnic_eth_ifs/{{ item.Name }}_{{ item.Moid }}.json"
+      loop: "{{ r_vnic_eth_ifs.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual SAN Connectivity Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/san_policies/{{ item.Name }}.json"
+      loop: "{{ r_san_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual vHBA FC Interface files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/vhba_fc_ifs/{{ item.Name }}_{{ item.Moid }}.json"
+      loop: "{{ r_vhba_fc_ifs.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Adapter Config Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/adapter_config_policies/{{ item.Name }}.json"
+      loop: "{{ r_adapter_config_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual BIOS Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/bios_policies/{{ item.Name }}.json"
+      loop: "{{ r_bios_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Boot Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/boot_policies/{{ item.Name }}.json"
+      loop: "{{ r_boot_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Firmware Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/firmware_policies/{{ item.Name }}.json"
+      loop: "{{ r_firmware_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual IMC Access Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/imc_access_policies/{{ item.Name }}.json"
+      loop: "{{ r_imc_access_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual KVM Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/kvm_policies/{{ item.Name }}.json"
+      loop: "{{ r_kvm_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Local User Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/local_user_policies/{{ item.Name }}.json"
+      loop: "{{ r_local_user_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual NTP Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/ntp_policies/{{ item.Name }}.json"
+      loop: "{{ r_ntp_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Power Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/power_policies/{{ item.Name }}.json"
+      loop: "{{ r_power_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual SNMP Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/snmp_policies/{{ item.Name }}.json"
+      loop: "{{ r_snmp_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual SSH Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/ssh_policies/{{ item.Name }}.json"
+      loop: "{{ r_ssh_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Storage Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/storage_policies/{{ item.Name }}.json"
+      loop: "{{ r_storage_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Syslog Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/syslog_policies/{{ item.Name }}.json"
+      loop: "{{ r_syslog_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Thermal Policy files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/thermal_policies/{{ item.Name }}.json"
+      loop: "{{ r_thermal_policies.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Server Profile Template files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/server_profile_templates/{{ item.Name }}.json"
+      loop: "{{ r_server_templates.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Server Profile files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/server_profiles/{{ item.Name }}.json"
+      loop: "{{ r_server_profiles.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Chassis Profile files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/chassis_profiles/{{ item.Name }}.json"
+      loop: "{{ r_chassis_profiles.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write individual Domain Profile files
+      copy:
+        content: "{{ item | to_nice_json }}"
+        dest: "{{ export_dir }}/domain_profiles/{{ item.Name }}.json"
+      loop: "{{ r_domain_profiles.api_response | default([]) | rejectattr('SharedScope', 'equalto', 'shared') | list }}"
+      when: item.Name is defined
+
+    - name: Write profile and template export files
+      copy:
+        content: "{{ item.data | rejectattr('SharedScope', 'equalto', 'shared') | list | to_nice_json }}"
+        dest: "{{ export_dir }}/{{ item.name }}.json"
+      loop:
+        - { name: "server_profile_templates", data: "{{ r_server_templates.api_response | default([]) }}" }
+        - { name: "server_profiles",          data: "{{ r_server_profiles.api_response  | default([]) }}" }
+        - { name: "chassis_profiles",         data: "{{ r_chassis_profiles.api_response | default([]) }}" }
+        - { name: "domain_profiles",          data: "{{ r_domain_profiles.api_response  | default([]) }}" }
+
+    # ================================================================
+    # FULL COMBINED SNAPSHOT
+    # ================================================================
+
+    - name: Write full combined inventory snapshot
+      copy:
+        content: "{{ combined | to_nice_json }}"
+        dest: "{{ export_dir }}/intersight_full_inventory.json"
+      vars:
+        combined:
+          exported_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          pools:
+            ip:   "{{ r_ip_pools.api_response   | default([]) }}"
+            mac:  "{{ r_mac_pools.api_response  | default([]) }}"
+            uuid: "{{ r_uuid_pools.api_response | default([]) }}"
+            wwn:  "{{ r_wwn_pools.api_response  | default([]) }}"
+          sub_policies:
+            eth_adapter:  "{{ r_eth_adapter_policies.api_response | default([]) }}"
+            eth_network:  "{{ r_eth_network_policies.api_response | default([]) }}"
+            eth_qos:      "{{ r_eth_qos_policies.api_response     | default([]) }}"
+            fc_adapter:   "{{ r_fc_adapter_policies.api_response  | default([]) }}"
+            fc_network:   "{{ r_fc_network_policies.api_response  | default([]) }}"
+            fc_qos:       "{{ r_fc_qos_policies.api_response      | default([]) }}"
+          connectivity:
+            lan_policies: "{{ r_lan_policies.api_response | default([]) }}"
+            vnic_eth_ifs: "{{ r_vnic_eth_ifs.api_response | default([]) }}"
+            san_policies: "{{ r_san_policies.api_response | default([]) }}"
+            vhba_fc_ifs:  "{{ r_vhba_fc_ifs.api_response  | default([]) }}"
+          policies:
+            adapter_config: "{{ r_adapter_config_policies.api_response | default([]) }}"
+            bios:           "{{ r_bios_policies.api_response           | default([]) }}"
+            boot:           "{{ r_boot_policies.api_response           | default([]) }}"
+            firmware:       "{{ r_firmware_policies.api_response       | default([]) }}"
+            imc_access:     "{{ r_imc_access_policies.api_response     | default([]) }}"
+            kvm:            "{{ r_kvm_policies.api_response            | default([]) }}"
+            local_user:     "{{ r_local_user_policies.api_response     | default([]) }}"
+            ntp:            "{{ r_ntp_policies.api_response            | default([]) }}"
+            power:          "{{ r_power_policies.api_response          | default([]) }}"
+            snmp:           "{{ r_snmp_policies.api_response           | default([]) }}"
+            ssh:            "{{ r_ssh_policies.api_response            | default([]) }}"
+            storage:        "{{ r_storage_policies.api_response        | default([]) }}"
+            syslog:         "{{ r_syslog_policies.api_response         | default([]) }}"
+            thermal:        "{{ r_thermal_policies.api_response        | default([]) }}"
+          profiles:
+            server_templates: "{{ r_server_templates.api_response | default([]) }}"
+            server:           "{{ r_server_profiles.api_response   | default([]) }}"
+            chassis:          "{{ r_chassis_profiles.api_response  | default([]) }}"
+            domain:           "{{ r_domain_profiles.api_response   | default([]) }}"
+
+    - name: Print export summary
+      debug:
+        msg: |
+          Export complete.  Files written to: {{ export_dir }}/
+
+          Pools:
+            ip_pools   : {{ r_ip_pools.api_response   | default([]) | length }} objects
+            mac_pools  : {{ r_mac_pools.api_response  | default([]) | length }} objects
+            uuid_pools : {{ r_uuid_pools.api_response | default([]) | length }} objects
+            wwn_pools  : {{ r_wwn_pools.api_response  | default([]) | length }} objects
+
+          Sub-Policies:
+            eth_adapter  : {{ r_eth_adapter_policies.api_response | default([]) | length }} objects
+            eth_network  : {{ r_eth_network_policies.api_response | default([]) | length }} objects
+            eth_qos      : {{ r_eth_qos_policies.api_response     | default([]) | length }} objects
+            fc_adapter   : {{ r_fc_adapter_policies.api_response  | default([]) | length }} objects
+            fc_network   : {{ r_fc_network_policies.api_response  | default([]) | length }} objects
+            fc_qos       : {{ r_fc_qos_policies.api_response      | default([]) | length }} objects
+
+          Connectivity:
+            lan_policies : {{ r_lan_policies.api_response | default([]) | length }} objects
+            vnic_eth_ifs : {{ r_vnic_eth_ifs.api_response | default([]) | length }} objects
+            san_policies : {{ r_san_policies.api_response | default([]) | length }} objects
+            vhba_fc_ifs  : {{ r_vhba_fc_ifs.api_response  | default([]) | length }} objects
+
+          Policies:
+            adapter_config : {{ r_adapter_config_policies.api_response | default([]) | length }} objects
+            bios           : {{ r_bios_policies.api_response           | default([]) | length }} objects
+            boot           : {{ r_boot_policies.api_response           | default([]) | length }} objects
+            firmware       : {{ r_firmware_policies.api_response       | default([]) | length }} objects
+            imc_access     : {{ r_imc_access_policies.api_response     | default([]) | length }} objects
+            kvm            : {{ r_kvm_policies.api_response            | default([]) | length }} objects
+            local_user     : {{ r_local_user_policies.api_response     | default([]) | length }} objects
+            ntp            : {{ r_ntp_policies.api_response            | default([]) | length }} objects
+            power          : {{ r_power_policies.api_response          | default([]) | length }} objects
+            snmp           : {{ r_snmp_policies.api_response           | default([]) | length }} objects
+            ssh            : {{ r_ssh_policies.api_response            | default([]) | length }} objects
+            storage        : {{ r_storage_policies.api_response        | default([]) | length }} objects
+            syslog         : {{ r_syslog_policies.api_response         | default([]) | length }} objects
+            thermal        : {{ r_thermal_policies.api_response        | default([]) | length }} objects
+
+          Profiles:
+            server_templates : {{ r_server_templates.api_response | default([]) | length }} objects
+            server           : {{ r_server_profiles.api_response   | default([]) | length }} objects
+            chassis          : {{ r_chassis_profiles.api_response  | default([]) | length }} objects
+            domain           : {{ r_domain_profiles.api_response   | default([]) | length }} objects
