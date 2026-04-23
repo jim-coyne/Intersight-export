@@ -114,7 +114,16 @@ Open `push/bios_policies.json` (or whichever type file) in any text editor and c
 | `"Owners"`, `"PermissionResources"` | Auto-assigned on creation — auto-stripped |
 | `"CreateTime"`, `"ModTime"` | Timestamps — auto-stripped |
 | `"Profiles"` | Profile attachments — auto-stripped to avoid conflicts |
+| `"Tags"` | Cisco system tags with reserved prefixes are rejected by the API — auto-stripped |
 | `"Ancestors"`, `"SharedScope"` | Read-only metadata — auto-stripped |
+| `"ConfigResult"`, `"ConfigContext"` | Read-only deployment state — auto-stripped |
+| `"UpdateStatus"`, `"Usage"`, `"UsageCount"` | Server-computed statistics — auto-stripped |
+| `"PartiallyDeployedPolicies"`, `"RemovedPolicies"` | Read-only deployment state — auto-stripped |
+| `"Size"`, `"Assigned"`, `"Reserved"`, `"V4Size"`, `"V6Size"` | Computed pool statistics — auto-stripped |
+| `"ShadowPools"`, `"Reservations"` | Computed pool relations — auto-stripped |
+| `"Priority"` | Read-only FC QoS computed field — auto-stripped |
+| `"OldInfo"`, `"LocationDetails"`, `"OverriddenList"` | Read-only profile/interface state — auto-stripped |
+| `"IscsiIpV4Config"`, `"IscsiIpV6Config"` | Read-only vNIC iSCSI configuration — auto-stripped |
 
 > **Tip:** The safest approach is to only edit `"Name"`, `"Description"`, and the actual settings fields for the policy type. Leave everything else as exported.
 
@@ -142,6 +151,10 @@ These are parent objects. The actual vNIC/vHBA interface objects live in `vnic_e
 
 **Pools** (`pools_ip`, `pools_mac`, `pools_uuid`, `pools_wwn`):
 Key fields: `"IpV4Blocks"` / `"MacBlocks"` / `"UuidSuffixBlocks"` / `"FcBlocks"` — define the address ranges to allocate from.
+Note: the `"Size"` field inside each block entry is computed by Intersight from `"From"` and `"To"` — the playbook strips it automatically.
+
+**vNIC / vHBA Interfaces** (`vnic_eth_ifs`, `vhba_fc_ifs`):
+These are child objects of a LAN/SAN connectivity policy. The `"LanConnectivityPolicy"` / `"SanConnectivityPolicy"` Moid reference in the exported JSON points to the **source** policy. If you are pushing to a different org or with a new name, update this Moid to the newly created parent policy's Moid before pushing.
 
 **Server Profiles / Templates**:
 These reference other policies by Moid. After pushing the dependent policies, update the Moid references in the profile JSON to match the newly created objects before pushing profiles.
@@ -292,3 +305,12 @@ A PATCH is trying to change the Organization field. This means `query_params` ma
 
 ### `changed=0` when expecting a new policy
 The policy already exists in Intersight with that exact name. Delete it first or use a different `name_suffix`.
+
+### `Cannot modify the read-only property '<field>'`
+The API body contains a field Intersight treats as read-only for the given object type. This is handled automatically by the `_ro_fields` list in the playbook. If you see this for a field not listed above, note the field name and it can be added to `_ro_fields`.
+
+### `Include either the size or the ending address in a block, not both`
+A pool block contains both `"Size"` and `"To"` — these are mutually exclusive. The playbook strips `"Size"` automatically from pool blocks. If using a manually prepared push file, remove the `"Size"` key from each entry in `IpV4Blocks`, `MacBlocks`, `UuidSuffixBlocks`, or `FcBlocks`.
+
+### `The value must be greater than or equal to '1'` (FC Adapter Policy)
+The exported `ErrorRecoverySettings.IoRetryTimeout` value is `0`, which is valid on the source but rejected on create. The playbook automatically sets it to `1` when pushing FC Adapter Policies.

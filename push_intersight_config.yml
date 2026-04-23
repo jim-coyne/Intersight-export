@@ -110,6 +110,27 @@
       - PartiallyDeployedPolicies
       - RemovedPolicies
       - ConfigResult
+      - Size
+      - Assigned
+      - Reserved
+      - V4Size
+      - V4Assigned
+      - V6Size
+      - V6Assigned
+      - ShadowPools
+      - Reservations
+      - Priority
+      - IscsiIpV4Config
+      - IscsiIpV6Config
+      - OldInfo
+      - LocationDetails
+      - OverriddenList
+      - SpVnics
+      - SpVhbas
+      - UndeployWfTasks
+      - InitialAutoDeployConfigComplete
+      - InitialAutoDeployMode
+      - InitialAutoDeployState
 
   # ----------------------------------------------------------------
   # Helper macro – used in every push task.
@@ -181,7 +202,9 @@
             (item | dict2items
              | rejectattr('key', 'in', _ro_fields)
              | list | items2dict)
-            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid},
+                       'IpV4Blocks': item.IpV4Blocks | default([]) | map('dict2items') | map('rejectattr', 'key', 'equalto', 'Size') | map('items2dict') | list,
+                       'IpV6Blocks': item.IpV6Blocks | default([]) | map('dict2items') | map('rejectattr', 'key', 'equalto', 'Size') | map('items2dict') | list})
           }}
         update_method: patch
         query_params:
@@ -209,7 +232,8 @@
             (item | dict2items
              | rejectattr('key', 'in', _ro_fields)
              | list | items2dict)
-            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid},
+                       'MacBlocks': item.MacBlocks | default([]) | map('dict2items') | map('rejectattr', 'key', 'equalto', 'Size') | map('items2dict') | list})
           }}
         update_method: patch
         query_params:
@@ -237,7 +261,8 @@
             (item | dict2items
              | rejectattr('key', 'in', _ro_fields)
              | list | items2dict)
-            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid},
+                       'UuidSuffixBlocks': item.UuidSuffixBlocks | default([]) | map('dict2items') | map('rejectattr', 'key', 'equalto', 'Size') | map('items2dict') | list})
           }}
         update_method: patch
         query_params:
@@ -265,7 +290,8 @@
             (item | dict2items
              | rejectattr('key', 'in', _ro_fields)
              | list | items2dict)
-            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid},
+                       'FcBlocks': item.FcBlocks | default([]) | map('dict2items') | map('rejectattr', 'key', 'equalto', 'Size') | map('items2dict') | list})
           }}
         update_method: patch
         query_params:
@@ -378,7 +404,8 @@
             (item | dict2items
              | rejectattr('key', 'in', _ro_fields)
              | list | items2dict)
-            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid}})
+            | combine({'Name': (name_prefix | default('')) + item.Name + (name_suffix | default('')), 'Organization': {'ClassId': 'mo.MoRef', 'ObjectType': 'organization.Organization', 'Moid': target_org_moid},
+                       'ErrorRecoverySettings': item.ErrorRecoverySettings | combine({'IoRetryTimeout': [item.ErrorRecoverySettings.IoRetryTimeout | default(1), 1] | max})})
           }}
         update_method: patch
         query_params:
