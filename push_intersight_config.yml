@@ -102,6 +102,14 @@
       - UuidLease
       - ResourceLease
       - SrcTemplate
+      - Profiles
+      - Tags
+      - UpdateStatus
+      - Usage
+      - UsageCount
+      - PartiallyDeployedPolicies
+      - RemovedPolicies
+      - ConfigResult
 
   # ----------------------------------------------------------------
   # Helper macro – used in every push task.
