@@ -209,8 +209,6 @@ ansible-playbook push_intersight_config.yml \
   -e "name_suffix=-DR"
 ```
 
----
-
 ## Push Playbook Parameters
 
 | Parameter | Default | Description |
@@ -245,6 +243,84 @@ ansible-playbook push_intersight_config.yml \
   -e "import_dir=$(pwd)/exports" \
   -e "name_suffix=-COPY"
 ```
+
+---
+
+## Step 5 — Verify the clone matches the original
+
+After pushing, use `compare_intersight_config.yml` to confirm that the live object in Intersight matches the exported source. This is useful for post-push validation and auditing.
+
+```bash
+ansible-playbook compare_intersight_config.yml \
+  -e "compare_type=<type>" \
+  -e "source_name=<original-name>" \
+  -e "pushed_name=<cloned-name>"
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `compare_type` | Yes | Object type — same values as `push_types` (e.g. `bios_policies`, `server_profile_templates`) |
+| `source_name` | Yes | Name of the original object as exported (filename without `.json`) |
+| `pushed_name` | Yes | Name of the live clone to look up in Intersight |
+| `export_dir` | No | Path to the exports directory. Defaults to `./exports` |
+| `source_live` | No | Set to `true` to fetch the source object from Intersight instead of reading a local file. Default: `false` |
+
+### Mode 1 — Export file vs live Intersight object (default)
+
+Reads the source from `./exports/<type>/<source_name>.json` and compares it to the named live object in Intersight. Use this after a pull → push workflow to verify the clone is faithful to what was exported.
+
+```bash
+ansible-playbook compare_intersight_config.yml \
+  -e "compare_type=server_profile_templates" \
+  -e "source_name=M5-Server-Profile" \
+  -e "pushed_name=M5-Server-Profile-TEST"
+```
+
+**Successful output:**
+
+```
+TASK [Compare result] **********************************************************
+ok: [localhost] => {
+    "msg": "✔ MATCH
+Source : server_profile_templates/M5-Server-Profile.json
+Live   : M5-Server-Profile-TEST (Moid: 69e97fda77696e3101a01af9)
+Result : All 11 compared fields are identical."
+}
+
+PLAY RECAP *********************************************************************
+localhost : ok=8  changed=0  unreachable=0  failed=0  skipped=7
+```
+
+### Mode 2 — Two live Intersight objects (`source_live=true`)
+
+Fetches both objects directly from Intersight. No local export file is needed. Use this to compare any two live objects — for example, an original template against a clone, or two profiles across environments.
+
+```bash
+ansible-playbook compare_intersight_config.yml \
+  -e "compare_type=server_profile_templates" \
+  -e "source_name=M5-Server-Profile" \
+  -e "pushed_name=M5-Server-Profile-TEST" \
+  -e "source_live=true"
+```
+
+**Successful output:**
+
+```
+TASK [Compare result] **********************************************************
+ok: [localhost] => {
+    "msg": "✔ MATCH
+Source : M5-Server-Profile (live, Moid: 63000b1677696e2d3121aedc)
+Live   : M5-Server-Profile-TEST (Moid: 69e97fda77696e3101a01af9)
+Result : All 11 compared fields are identical."
+}
+
+PLAY RECAP *********************************************************************
+localhost : ok=8  changed=0  unreachable=0  failed=0  skipped=7
+```
+
+### What the playbook ignores
+
+The compare playbook automatically ignores read-only and auto-generated fields (Moid, timestamps, tags, profile attachments, etc.) and the `Name` field itself — so a clone with a different name suffix still compares correctly against its source.
 
 ---
 
@@ -291,26 +367,26 @@ ansible-playbook push_intersight_config.yml \
 
 ## Troubleshooting
 
-### `'target_org_moid' is undefined`
+ `'target_org_moid' is undefined`
 The org lookup task couldn't find the organization. Verify `target_org` matches the exact organization name in Intersight (case-sensitive).
 
-### `Policy type is already attached to profiles`
+ `Policy type is already attached to profiles`
 The source policy is linked to server profiles. The push playbook strips the `Profiles` field automatically. If this error still appears, a previous push created the policy with profile references attached — delete that policy from Intersight and re-run.
 
-### `Relationship to organization is missing`
+ `Relationship to organization is missing`
 The Organization reference is invalid. Ensure `target_org` exactly matches the organization name in Intersight and your API key has access to it.
 
-### `Cannot modify read-only relationship Organization`
+ `Cannot modify read-only relationship Organization`
 A PATCH is trying to change the Organization field. This means `query_params` matched an existing policy but it belongs to a different org. Verify the name (with prefix/suffix) is unique within `target_org`.
 
-### `changed=0` when expecting a new policy
+ `changed=0` when expecting a new policy
 The policy already exists in Intersight with that exact name. Delete it first or use a different `name_suffix`.
 
-### `Cannot modify the read-only property '<field>'`
+ `Cannot modify the read-only property '<field>'`
 The API body contains a field Intersight treats as read-only for the given object type. This is handled automatically by the `_ro_fields` list in the playbook. If you see this for a field not listed above, note the field name and it can be added to `_ro_fields`.
 
-### `Include either the size or the ending address in a block, not both`
+ `Include either the size or the ending address in a block, not both`
 A pool block contains both `"Size"` and `"To"` — these are mutually exclusive. The playbook strips `"Size"` automatically from pool blocks. If using a manually prepared push file, remove the `"Size"` key from each entry in `IpV4Blocks`, `MacBlocks`, `UuidSuffixBlocks`, or `FcBlocks`.
 
-### `The value must be greater than or equal to '1'` (FC Adapter Policy)
+ `The value must be greater than or equal to '1'` (FC Adapter Policy)
 The exported `ErrorRecoverySettings.IoRetryTimeout` value is `0`, which is valid on the source but rejected on create. The playbook automatically sets it to `1` when pushing FC Adapter Policies.

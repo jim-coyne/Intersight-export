@@ -1,0 +1,338 @@
+---
+# =============================================================================
+# compare_intersight_config.yml
+# =============================================================================
+# Purpose : Compare an exported (pre-push) JSON object against the live
+#           object in Intersight (post-push) and report whether they match.
+#           Ignores read-only / auto-generated fields so that meaningful
+#           configuration differences are highlighted.
+#
+# Credentials:
+#   api-key.txt   – API Key ID  (single line, no trailing newline)
+#   SecretKey.txt – EC private key in PEM format
+#
+# Required parameters:
+#   compare_type   – the object type key (e.g. bios_policies, ntp_policies)
+#   source_name    – name of the source object (export filename without .json, or live name)
+#   pushed_name    – name of the object to compare against in Intersight
+#
+# Optional parameters:
+#   export_dir     – directory where exports live (default: ./exports)
+#   source_live    – set to 'true' to fetch source from Intersight instead of a local file
+#                    (default: false — reads from ./exports/<type>/<source_name>.json)
+#
+# Usage examples:
+#   # Compare exported BIOS policy to its -TEST3 clone (default: file vs live)
+#   ansible-playbook compare_intersight_config.yml \
+#     -e "compare_type=bios_policies" \
+#     -e "source_name=SMF-COPY" \
+#     -e "pushed_name=SMF-COPY-TEST3"
+#
+#   # Compare two live Intersight objects (no local file needed)
+#   ansible-playbook compare_intersight_config.yml \
+#     -e "compare_type=bios_policies" \
+#     -e "source_name=SMF-COPY" \
+#     -e "pushed_name=SMF-COPY-TEST3" \
+#     -e "source_live=true"
+#
+#   # Compare boot policy from a custom export directory
+#   ansible-playbook compare_intersight_config.yml \
+#     -e "compare_type=boot_policies" \
+#     -e "source_name=cx-cbm-lab-boot-order-policy" \
+#     -e "pushed_name=cx-cbm-lab-boot-order-policy-TEST3" \
+#     -e "export_dir=/path/to/exports"
+# =============================================================================
+
+- name: Compare Intersight Configuration
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    api_key_id:      "{{ lookup('file', playbook_dir + '/api-key.txt') | trim }}"
+    api_private_key: "{{ playbook_dir }}/SecretKey.txt"
+    api_uri:         "https://intersight.com/api/v1"
+    export_dir:      "{{ playbook_dir }}/exports"
+
+    # Required -- set via -e
+    compare_type: ""
+    source_name:  ""
+    pushed_name:  ""
+    # Optional -- set source_live=true to compare two live Intersight objects
+    source_live:  false
+
+    # ---------------------------------------------------------------
+    # Mapping from compare_type key to Intersight REST resource path
+    # ---------------------------------------------------------------
+    _resource_paths:
+      pools_ip:                  /ippool/Pools
+      pools_mac:                 /macpool/Pools
+      pools_uuid:                /uuidpool/Pools
+      pools_wwn:                 /fcpool/Pools
+      eth_adapter_policies:      /vnic/EthAdapterPolicies
+      eth_network_policies:      /vnic/EthNetworkPolicies
+      eth_qos_policies:          /vnic/EthQosPolicies
+      fc_adapter_policies:       /vnic/FcAdapterPolicies
+      fc_network_policies:       /vnic/FcNetworkPolicies
+      fc_qos_policies:           /vnic/FcQosPolicies
+      adapter_config_policies:   /adapter/ConfigPolicies
+      bios_policies:             /bios/Policies
+      boot_policies:             /boot/PrecisionPolicies
+      firmware_policies:         /firmware/Policies
+      imc_access_policies:       /access/Policies
+      kvm_policies:              /kvm/Policies
+      local_user_policies:       /iam/EndPointUserPolicies
+      ntp_policies:              /ntp/Policies
+      power_policies:            /power/Policies
+      snmp_policies:             /snmp/Policies
+      ssh_policies:              /ssh/Policies
+      storage_policies:          /storage/StoragePolicies
+      syslog_policies:           /syslog/Policies
+      thermal_policies:          /thermal/Policies
+      lan_policies:              /vnic/LanConnectivityPolicies
+      san_policies:              /vnic/SanConnectivityPolicies
+      vnic_eth_ifs:              /vnic/EthIfs
+      vhba_fc_ifs:               /vnic/FcIfs
+      server_profile_templates:  /server/ProfileTemplates
+      server_profiles:           /server/Profiles
+      chassis_profiles:          /chassis/Profiles
+      domain_profiles:           /fabric/SwitchClusterProfiles
+
+    # ---------------------------------------------------------------
+    # Fields to exclude from comparison.
+    # These are read-only, auto-generated, or intentionally differ
+    # between source and clone (name, timestamps, Moid, etc.).
+    # ---------------------------------------------------------------
+    _ignore_fields:
+      - Moid
+      - Name
+      - AccountMoid
+      - DomainGroupMoid
+      - Organization
+      - CreateTime
+      - ModTime
+      - SharedScope
+      - Owners
+      - PermissionResources
+      - Ancestors
+      - Profiles
+      - Tags
+      - SrcTemplate
+      - ConfigResult
+      - ConfigContext
+      - ConfigChangeContext
+      - ConfigChanges
+      - ConfigChangeDetails
+      - UpdateStatus
+      - Usage
+      - UsageCount
+      - PartiallyDeployedPolicies
+      - RemovedPolicies
+      - Size
+      - Assigned
+      - Reserved
+      - V4Size
+      - V6Size
+      - V4Assigned
+      - V6Assigned
+      - ShadowPools
+      - Reservations
+      - Priority
+      - OldInfo
+      - LocationDetails
+      - OverriddenList
+      - SpVnics
+      - SpVhbas
+      - UndeployWfTasks
+      - InitialAutoDeployConfigComplete
+      - InitialAutoDeployMode
+      - InitialAutoDeployState
+      - IscsiIpV4Config
+      - IscsiIpV6Config
+      - PolicyChangeDetails
+      - ReportedPolicyChanges
+      - ScheduledActions
+      - TemplateActions
+      - TemplateSyncErrors
+      - TemplateSyncStatus
+      - DeployStatus
+      - DeployedPolicies
+      - DeployedSwitches
+      - RunningWorkflows
+      - ResourceLease
+      - UuidLease
+      - AssignedServer
+      - AssociatedServer
+      - PostDeployAction
+      - ReservationReferences
+      - InternalReservationReferences
+      - EthIfs
+      - PolicyBucket
+      - Parent
+      - LanConnectivityPolicy
+      - SanConnectivityPolicy
+      - Profile
+      - WwpnLease
+      - MacLease
+      - IpLease
+
+  tasks:
+
+    # ================================================================
+    # INPUT VALIDATION
+    # ================================================================
+
+    - name: Fail if required parameters are missing
+      fail:
+        msg: >-
+          Required parameters missing. Usage:
+            -e "compare_type=<type>" -e "source_name=<original_name>" -e "pushed_name=<pushed_name>"
+          Available types: {{ _resource_paths.keys() | list | sort | join(', ') }}
+      when: compare_type == "" or source_name == "" or pushed_name == ""
+
+    - name: Fail if compare_type is not recognised
+      fail:
+        msg: >-
+          Unknown compare_type '{{ compare_type }}'.
+          Available types: {{ _resource_paths.keys() | list | sort | join(', ') }}
+      when: compare_type not in _resource_paths
+
+    # ================================================================
+    # LOAD SOURCE (EXPORTED JSON)
+    # ================================================================
+
+    - name: Check export file exists
+      stat:
+        path: "{{ export_dir }}/{{ compare_type }}/{{ source_name }}.json"
+      register: _export_stat
+      when: not source_live
+
+    - name: Fail if export file not found
+      fail:
+        msg: >-
+          Export file not found: {{ export_dir }}/{{ compare_type }}/{{ source_name }}.json
+          Run pull_intersight_config.yml first, or check the source_name spelling.
+      when: not source_live and _export_stat.stat is defined and not _export_stat.stat.exists
+
+    - name: Load source object from export file
+      set_fact:
+        _source_raw: "{{ lookup('file', export_dir + '/' + compare_type + '/' + source_name + '.json') | from_json }}"
+      when: not source_live
+
+    - name: "Fetch source object '{{ source_name }}' from Intersight"
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   "{{ _resource_paths[compare_type] }}"
+        query_params:
+          $filter: "Name eq '{{ source_name }}'"
+      register: _source_result
+      when: source_live
+
+    - name: Fail if source object not found in Intersight
+      fail:
+        msg: >-
+          Source object '{{ source_name }}' (type: {{ compare_type }}) not found in Intersight.
+          Verify the source_name spelling.
+      when: source_live and (_source_result.api_response is not defined or _source_result.api_response.Moid is not defined)
+
+    - name: Set source from live Intersight object
+      set_fact:
+        _source_raw: "{{ _source_result.api_response }}"
+      when: source_live
+
+    - name: Strip ignored fields from source
+      set_fact:
+        _source_clean: >-
+          {{
+            _source_raw | dict2items
+            | rejectattr('key', 'in', _ignore_fields)
+            | list | items2dict
+          }}
+
+    # ================================================================
+    # FETCH LIVE OBJECT FROM INTERSIGHT
+    # ================================================================
+
+    - name: "Fetch pushed object '{{ pushed_name }}' from Intersight"
+      cisco.intersight.intersight_rest_api:
+        api_key_id:      "{{ api_key_id }}"
+        api_private_key: "{{ api_private_key }}"
+        api_uri:         "{{ api_uri }}"
+        resource_path:   "{{ _resource_paths[compare_type] }}"
+        query_params:
+          $filter: "Name eq '{{ pushed_name }}'"
+      register: _live_result
+
+    - name: Fail if pushed object not found in Intersight
+      fail:
+        msg: >-
+          Object '{{ pushed_name }}' (type: {{ compare_type }}) not found in Intersight.
+          Verify the pushed_name and that the push playbook ran successfully.
+      when: _live_result.api_response is not defined or _live_result.api_response.Moid is not defined
+
+    - name: Strip ignored fields from live object
+      set_fact:
+        _live_clean: >-
+          {{
+            _live_result.api_response | dict2items
+            | rejectattr('key', 'in', _ignore_fields)
+            | list | items2dict
+          }}
+
+    # ================================================================
+    # COMPARE
+    # ================================================================
+
+    - name: Find fields present in source but missing or different in live
+      set_fact:
+        _diffs: >-
+          {{
+            _source_clean | dict2items
+            | selectattr('value', '!=', (_live_clean[item.key] | default('__MISSING__')))
+            | list
+          }}
+      vars:
+        item: "{{ _source_clean | dict2items | first }}"
+      ignore_errors: true
+
+    - name: Build diff report
+      set_fact:
+        _diff_list: >-
+          {%- set diffs = [] -%}
+          {%- for k, v in _source_clean.items() -%}
+            {%- set live_val = _live_clean.get(k, '__MISSING__') -%}
+            {%- if v != live_val -%}
+              {%- set _ = diffs.append({'field': k, 'source': v, 'live': live_val}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for k, v in _live_clean.items() -%}
+            {%- if k not in _source_clean -%}
+              {%- set _ = diffs.append({'field': k, 'source': '__MISSING__', 'live': v}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ diffs }}
+
+    # ================================================================
+    # REPORT
+    # ================================================================
+
+    - name: "Compare result"
+      assert:
+        that: _diff_list | length == 0
+        success_msg: |
+          ✔ MATCH
+          Source : {{ compare_type + '/' + source_name + '.json' if not source_live else source_name + ' (live, Moid: ' + _source_result.api_response.Moid + ')' }}
+          Live   : {{ pushed_name }} (Moid: {{ _live_result.api_response.Moid }})
+          Result : All {{ _source_clean | length }} compared fields are identical.
+        fail_msg: |
+          ✘ DIFFERENCES FOUND
+          Source : {{ compare_type + '/' + source_name + '.json' if not source_live else source_name + ' (live, Moid: ' + _source_result.api_response.Moid + ')' }}
+          Live   : {{ pushed_name }} (Moid: {{ _live_result.api_response.Moid }})
+          {{ _diff_list | length }} field(s) differ:
+          {% for d in _diff_list %}
+          ──────────────────────────────────────────────
+          Field  : {{ d.field }}
+          Source : {{ d.source }}
+          Live   : {{ d.live }}
+          {% endfor %}
